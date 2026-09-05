@@ -22,6 +22,7 @@ fields, every one of which would otherwise have been a NULL function pointer.
 import argparse
 import pathlib
 import re
+import subprocess
 import sys
 
 HEADER_REL = "xla/pjrt/c/pjrt_c_api.h"
@@ -67,6 +68,30 @@ def api_version(text):
     return f"{major.group(1)}.{minor.group(1)}"
 
 
+def source_commit(src):
+    """The openxla/xla commit `src` came from, or None if it cannot be known.
+
+    Only a checkout laid out the way openxla/xla is -- the header at
+    <repo root>/xla/pjrt/c/pjrt_c_api.h -- gets an answer. A header copied into
+    some other tree (an R package's inst/include, say) sits in a repository
+    whose HEAD says nothing about XLA, and recording that would be worse than
+    recording nothing: the README names openxla/xla as the source.
+    """
+    try:
+        root = subprocess.run(
+            ["git", "-C", str(src.parent), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    if src.resolve() != (pathlib.Path(root) / HEADER_REL).resolve():
+        return None
+    return subprocess.run(
+        ["git", "-C", root, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -75,6 +100,12 @@ def main():
         type=pathlib.Path,
         required=True,
         help="pjrt_c_api.h, or a tree containing " + HEADER_REL,
+    )
+    ap.add_argument(
+        "--commit",
+        help="the openxla/xla commit this header is from. Detected "
+        "automatically from an openxla/xla checkout; pass it when vendoring "
+        "from a copy, which cannot say on its own.",
     )
     args = ap.parse_args()
 
@@ -85,6 +116,7 @@ def main():
 
     text = src.read_text()
     version = api_version(text)
+    commit = args.commit or source_commit(src)
 
     # Some downstreams rename the PJRT_Api function-pointer fields (appending an
     # underscore) because in C++ a member named identically to its own type is
@@ -127,11 +159,19 @@ def main():
         "Last synced from:\n"
         "\n"
         "* https://github.com/openxla/xla.git\n"
-        f"* PJRT API version: {version}\n"
+        + (
+            f"* commit: {commit}\n"
+            if commit
+            else "* commit: not recorded -- this header was vendored from a "
+            "copy rather than\n"
+            "  from an openxla/xla checkout. Pass `--commit` to record it.\n"
+        )
+        + f"* PJRT API version: {version}\n"
     )
 
     print(f"vendored {HEADER_REL} at PJRT API version {version}")
     print(f"  source: {src}")
+    print(f"  commit: {commit or 'not recorded (pass --commit)'}")
     print(f"generated {STUBS_DST} with {len(fields)} stubs")
     # Not a suggestion. CMake does not track this header as a dependency of the
     # plugin's translation units, so an incremental build after re-vendoring
