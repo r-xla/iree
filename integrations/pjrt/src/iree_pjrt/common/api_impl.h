@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -17,7 +18,9 @@
 #include <vector>
 
 #include "iree/base/api.h"
+#include "iree/async/frontier_tracker.h"
 #include "iree/hal/api.h"
+#include "iree/hal/device_group.h"
 #include "iree/modules/hal/module.h"
 #include "iree/vm/api.h"
 #include "iree/vm/bytecode/module.h"
@@ -147,12 +150,45 @@ class BufferInstance {
 
 class DeviceDescription {
  public:
-  DeviceDescription(int32_t client_id, iree_hal_device_info_t* info)
+  DeviceDescription(int32_t client_id, iree_hal_device_info_t* info,
+                    std::string_view platform_name)
       : client_id_(client_id), info_(info) {
     // Initialize debug strings.
-    user_string_ = std::string(info_->path.data, info_->path.size);
+    //
+    // PJRT_DeviceDescription_ToString is not just a debug nicety: clients
+    // parse it to recover which platform a device belongs to, and then look
+    // the client up by that name. IREE's own naming does not survive that
+    // round trip -- the HAL *path* is empty for any driver that does not need
+    // one (local-sync and local-task, i.e. every CPU device), and the HAL
+    // *name* is the driver-agnostic "default". An empty string is worse than
+    // useless: r-xla/pjrt indexes a cache by it, and "" is not a usable key
+    // there.
+    //
+    // So the user string is synthesized from the platform name in the shape
+    // XLA's plugins use, "<Platform>Device(id=N)", which is what a caller
+    // reading the leading run of letters expects to find.
+    user_string_ = DeviceUserString(platform_name, info_->device_id);
     debug_string_ = std::string(info_->name.data, info_->name.size);
     kind_string_ = std::string(info_->name.data, info_->name.size);
+  }
+
+  // "cpu", 0 -> "CpuDevice(id=0)". Separators are dropped and each following
+  // letter capitalized ("local-task" -> "LocalTask") so that the platform is
+  // one unbroken run of letters, which is how callers pick it back out.
+  static std::string DeviceUserString(std::string_view platform_name,
+                                      int64_t device_id) {
+    std::string camel;
+    bool upper = true;
+    for (char c : platform_name) {
+      if (c == '-' || c == '_' || c == ' ') {
+        upper = true;
+        continue;
+      }
+      camel.push_back(upper ? toupper(c) : c);
+      upper = false;
+    }
+    if (camel.empty()) camel = "Iree";
+    return camel + "Device(id=" + std::to_string(device_id) + ")";
   }
   ~DeviceDescription();
   operator PJRT_DeviceDescription*() {
@@ -224,9 +260,11 @@ class MemoryInstance {
 
 class DeviceInstance {
  public:
+  // Defined out-of-line in api_impl.cc: the initializer list reads
+  // client.cached_platform_name(), and ClientInstance is only declared further
+  // down this header.
   DeviceInstance(int client_id, ClientInstance& client,
-                 iree_hal_driver_t* driver, iree_hal_device_info_t* info)
-      : client_(client), driver_(driver), info_(client_id, info) {}
+                 iree_hal_driver_t* driver, iree_hal_device_info_t* info);
   ~DeviceInstance();
   operator PJRT_Device*() { return reinterpret_cast<PJRT_Device*>(this); }
   static void BindApi(PJRT_Api* api);
@@ -298,6 +336,14 @@ class DeviceInstance {
   ClientInstance& client_;
   iree_hal_driver_t* driver_;  // Owned by client.
   iree::vm::ref<iree_hal_device_t> device_;
+  // A HAL device is not usable on its own: iree_hal_device_assign_topology_info
+  // installs the async frontier tracker its queues advance on completion, and
+  // that only happens when the device is put into a group ("devices are not
+  // topology-complete until they have been assigned to a group", device.h).
+  // Both are held for the device's lifetime -- releasing the group would
+  // retire the queues' frontiers out from under it.
+  iree_hal_device_group_t* device_group_ = nullptr;
+  iree_async_frontier_tracker_t* frontier_tracker_ = nullptr;
   iree::vm::ref<iree_hal_semaphore_t> main_timeline_;
   iree::vm::ref<iree_hal_semaphore_t> transfer_timeline_;
   // A fence that is initialized to the start of the transfer timeline,
@@ -328,10 +374,20 @@ class EventInstance {
   ErrorInstance* error();
   bool is_ready();
 
+  // Block until the event is ready and return its status (a clone, owned by
+  // the caller). Upstream leaves PJRT_Event_Await unimplemented because JAX
+  // only ever registers an OnReady callback, but a synchronous client -- e.g.
+  // r-xla/pjrt, which awaits every execute and every host transfer -- calls
+  // this on the very first buffer it reads back.
+  iree_status_t Await();
+
  private:
   void SignalReady(iree_status_t status);
 
   std::mutex lock_;
+  // Signalled by SignalReady() so Await() can block rather than spin on
+  // is_ready(). Waited on under `lock_`, which also guards is_ready_.
+  std::condition_variable ready_cv_;
   iree_status_t status_ = iree_ok_status();
   bool is_ready_;
   std::vector<std::pair<PJRT_Event_OnReadyCallback, void*>> pending_callbacks_;
