@@ -6,6 +6,8 @@
 
 #include <functional>
 #include <iostream>  // TODO: Remove
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include "iree/compiler/embedding_api.h"
@@ -43,6 +45,42 @@ class IREECompilerJob : public CompilerJob {
                   iree_compiler_invocation_t* inv,
                   SessionRecycler session_recycler)
       : session_(session), inv_(inv), session_recycler_(session_recycler) {}
+
+  // Diagnostic sink for ireeCompilerInvocationEnableCallbackDiagnostics.
+  //
+  // Without this, a pipeline failure reaches the caller as an empty string:
+  // GetErrorMessage() below has nothing to report unless a *flag* was
+  // rejected (which is what sets error_), while everything the pass pipeline
+  // says -- "failed to legalize operation 'stablehlo.cholesky'", and so on --
+  // goes to the diagnostic engine instead. A PJRT client embedded in another
+  // process (R, here) then reports a compile failure with no reason attached,
+  // and the actual text is somewhere in a stderr stream it may not even be
+  // showing.
+  //
+  // May be called from any thread, hence the lock.
+  static void OnDiagnostic(enum iree_compiler_diagnostic_severity_t severity,
+                           const char* message, size_t message_size,
+                           void* user_data) {
+    auto* self = static_cast<IREECompilerJob*>(user_data);
+    const char* prefix;
+    switch (severity) {
+      case IREE_COMPILER_DIAGNOSTIC_SEVERITY_ERROR:
+        prefix = "error: ";
+        break;
+      case IREE_COMPILER_DIAGNOSTIC_SEVERITY_WARNING:
+        prefix = "warning: ";
+        break;
+      default:
+        // Notes and remarks carry the "see also" context of an error, so they
+        // are kept, just unlabelled.
+        prefix = "";
+        break;
+    }
+    std::lock_guard<std::mutex> guard(self->diagnostics_mutex_);
+    self->diagnostics_.append(prefix);
+    self->diagnostics_.append(message, message_size);
+    self->diagnostics_.push_back('\n');
+  }
   ~IREECompilerJob() {
     if (error_) {
       ireeCompilerErrorDestroy(error_);
@@ -59,10 +97,23 @@ class IREECompilerJob : public CompilerJob {
   }
 
   std::string GetErrorMessage() override {
-    if (!error_) return std::string();
-    const char* cstr = ireeCompilerErrorGetMessage(error_);
-    return std::string(cstr);
+    std::string message;
+    if (error_) {
+      message = ireeCompilerErrorGetMessage(error_);
+    }
+    // Append whatever the diagnostic engine said. On a pipeline failure this
+    // is the only description there is; on a rejected flag it adds context to
+    // error_'s summary.
+    std::lock_guard<std::mutex> guard(diagnostics_mutex_);
+    if (!diagnostics_.empty()) {
+      if (!message.empty()) message.push_back('\n');
+      message.append(diagnostics_);
+    }
+    return message;
   }
+
+  std::mutex diagnostics_mutex_;
+  std::string diagnostics_;
 
   void EnableCrashDumps(
       ArtifactDumper::Transaction* artifact_transaction) override {
@@ -209,13 +260,25 @@ std::unique_ptr<CompilerJob> IREECompiler::StartJob() {
   auto* session = ireeCompilerSessionCreate();
   auto* inv = ireeCompilerInvocationCreate(session);
 
-  // TODO: Capture diagnostics, etc vs spewing to stderr.
+  // Console diagnostics are kept so that warnings on an otherwise successful
+  // compile still reach a human -- the f64-to-f32 demotion notice, for one,
+  // which changes the public function signature and is worth seeing. Errors
+  // are additionally captured below and returned to the caller, so they show
+  // up twice: once on stderr and once attached to the failure. That is the
+  // right trade for a plugin loaded inside another process, where stderr may
+  // be interleaved with unrelated output or not shown at all.
   ireeCompilerInvocationEnableConsoleDiagnostics(inv);
 
   auto job = std::make_unique<IREECompilerJob>(
       session, inv, [](iree_compiler_session_t* session) {
         ireeCompilerSessionDestroy(session);
       });
+
+  // Registered after the job exists, since the job is the callback's userData.
+  // Safe for the invocation's whole life: the job owns the invocation and
+  // destroys it in its own destructor.
+  ireeCompilerInvocationEnableCallbackDiagnostics(
+      inv, /*flags=*/0, &IREECompilerJob::OnDiagnostic, job.get());
 
   // The input here should be stablehlo if coming from JAX and xla if
   // importing from XLA HLO. Set to xla for now as it merely runs an
