@@ -11,6 +11,5 @@ for why that has to be generated rather than maintained by hand.
 Last synced from:
 
 * https://github.com/openxla/xla.git
-* commit: not recorded -- this header was vendored from a copy rather than
-  from an openxla/xla checkout. Pass `--commit` to record it.
+* commit: 6b73c4c49eb0c5aee1963c1e34c7cc8ba92ac202
 * PJRT API version: 0.114
