@@ -676,6 +676,15 @@ std::optional<PJRT_Buffer_Type> BufferInstance::element_type() {
 
 DeviceDescription::~DeviceDescription() = default;
 
+// Out-of-line because the initializer list reads client.cached_platform_name()
+// and so needs ClientInstance complete (see the declaration in api_impl.h).
+DeviceInstance::DeviceInstance(int client_id, ClientInstance& client,
+                               iree_hal_driver_t* driver,
+                               iree_hal_device_info_t* info)
+    : client_(client),
+      driver_(driver),
+      info_(client_id, info, client.cached_platform_name()) {}
+
 void DeviceDescription::BindApi(PJRT_Api* api) {
   api->PJRT_DeviceDescription_Id =
       +[](PJRT_DeviceDescription_Id_Args* args) -> PJRT_Error* {
@@ -774,7 +783,12 @@ std::string_view MemoryInstance::ToString() {
 // DeviceInstance
 //===----------------------------------------------------------------------===//
 
-DeviceInstance::~DeviceInstance() = default;
+DeviceInstance::~DeviceInstance() {
+  // Ordered: the group holds a reference to the device and assigns the
+  // tracker to its queues, so it goes first and the tracker second.
+  iree_hal_device_group_release(device_group_);
+  iree_async_frontier_tracker_release(frontier_tracker_);
+}
 
 void DeviceInstance::BindApi(PJRT_Api* api) {
   api->PJRT_Device_IsAddressable =
@@ -835,6 +849,20 @@ iree_status_t DeviceInstance::OpenDevice() {
       client_.host_allocator(), &device_);
   iree_async_proactor_pool_release(proactor_pool);
   IREE_RETURN_IF_ERROR(status);
+
+  // Make the device topology-complete. Creating the device is not enough: the
+  // task queues advance an async frontier tracker whenever an operation
+  // completes, and that tracker is only installed by
+  // iree_hal_device_assign_topology_info(), which happens when the device is
+  // added to a group. Without this, the first queue operation on the device --
+  // the alloca inside HostBufferToDevice(), for instance -- reaches
+  // iree_async_frontier_tracker_advance() with a NULL tracker and segfaults.
+  IREE_RETURN_IF_ERROR(iree_async_frontier_tracker_create(
+      iree_async_frontier_tracker_options_default(), client_.host_allocator(),
+      &frontier_tracker_));
+  IREE_RETURN_IF_ERROR(iree_hal_device_group_create_from_device(
+      device_.get(), frontier_tracker_, client_.host_allocator(),
+      &device_group_));
 
   IREE_RETURN_IF_ERROR(iree_hal_semaphore_create(
       device(), IREE_HAL_QUEUE_AFFINITY_ANY, 0ull,
@@ -1145,6 +1173,29 @@ iree_status_t DeviceInstance::HostBufferToDevice(
   }
   iree_device_size_t element_type_byte_size =
       iree_hal_element_dense_byte_count(element_type);
+
+  // PJRT allows `byte_strides` to be empty, which means "dense layout with
+  // dimensions in major-to-minor order" (see PJRT_Client_BufferFromHostBuffer
+  // in pjrt_c_api.h). Everything below assumes strides are present: the loop
+  // that follows derives `byte_length` from them, and computeBroadcastArgs()
+  // indexes them `num_dims` times. With empty strides that means a transfer
+  // length of one element and a NULL dereference respectively, so synthesize
+  // the dense strides here rather than special-casing each use.
+  std::array<iree_hal_dim_t, kMaxDims> dense_byte_strides;
+  if (num_byte_strides == 0 && num_dims > 0) {
+    if (num_dims > dense_byte_strides.size()) {
+      return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
+                              "only supports up to %d dims but got %d",
+                              (int)dense_byte_strides.size(), (int)num_dims);
+    }
+    iree_device_size_t stride = element_type_byte_size;
+    for (int i = (int)num_dims - 1; i >= 0; --i) {
+      dense_byte_strides[i] = stride;
+      stride *= dims[i];
+    }
+    byte_strides = reinterpret_cast<const int64_t*>(dense_byte_strides.data());
+    num_byte_strides = num_dims;
+  }
 
   // We need to check for special cases (splatting, zerodim):
   bool is_splat = element_type_byte_size == 1 || element_type_byte_size == 2 ||
@@ -1795,8 +1846,9 @@ void EventInstance::BindApi(PJRT_Api* api) {
   };
   api->PJRT_Event_Await = +[](PJRT_Event_Await_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_Await");
-    return MakeError(
-        iree_make_status(IREE_STATUS_UNIMPLEMENTED, "PJRT_Event_Await"));
+    // MakeError() maps an ok status to nullptr, which is what a successful
+    // await returns.
+    return MakeError(EventInstance::Unwrap(args->event)->Await());
   };
   api->PJRT_Event_OnReady = +[](PJRT_Event_OnReady_Args* args) -> PJRT_Error* {
     IREE_TRACE_SCOPE_NAMED("PJRT_Event_OnReady");
@@ -1813,6 +1865,15 @@ ErrorInstance* EventInstance::error() {
 bool EventInstance::is_ready() {
   std::lock_guard<std::mutex> guard(lock_);
   return is_ready_;
+}
+
+iree_status_t EventInstance::Await() {
+  std::unique_lock<std::mutex> guard(lock_);
+  ready_cv_.wait(guard, [this] { return is_ready_; });
+  // Cloned, not moved: the event keeps owning status_ (its destructor ignores
+  // it, and error() may be asked for it again), while the caller takes
+  // ownership of what it gets back via MakeError().
+  return iree_status_clone(status_);
 }
 
 iree_status_t EventInstance::OnReady(PJRT_Event_OnReadyCallback callback,
@@ -1851,6 +1912,9 @@ void EventInstance::SignalReady(iree_status_t status) {
     is_ready_ = true;
     status_ = status;
     local_status = status_;
+    // Notified under the lock so a waiter that has just evaluated the
+    // predicate cannot miss it.
+    ready_cv_.notify_all();
   }
 
   // Trigger callbacks outside of the lock.
