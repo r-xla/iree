@@ -53,9 +53,8 @@ class IREECompilerJob : public CompilerJob {
   // rejected (which is what sets error_), while everything the pass pipeline
   // says -- "failed to legalize operation 'stablehlo.cholesky'", and so on --
   // goes to the diagnostic engine instead. A PJRT client embedded in another
-  // process (R, here) then reports a compile failure with no reason attached,
-  // and the actual text is somewhere in a stderr stream it may not even be
-  // showing.
+  // process then reports a compile failure with no reason attached, and the
+  // actual text is somewhere in a stderr stream it may not even be showing.
   //
   // May be called from any thread, hence the lock.
   static void OnDiagnostic(enum iree_compiler_diagnostic_severity_t severity,

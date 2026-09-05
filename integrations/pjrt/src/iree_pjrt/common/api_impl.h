@@ -8,8 +8,8 @@
 #define IREE_PJRT_PLUGIN_PJRT_COMMON_API_IMPL_H_
 
 #include <atomic>
-#include <memory>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -153,20 +153,10 @@ class DeviceDescription {
   DeviceDescription(int32_t client_id, iree_hal_device_info_t* info,
                     std::string_view platform_name)
       : client_id_(client_id), info_(info) {
-    // Initialize debug strings.
-    //
-    // PJRT_DeviceDescription_ToString is not just a debug nicety: clients
-    // parse it to recover which platform a device belongs to, and then look
-    // the client up by that name. IREE's own naming does not survive that
-    // round trip -- the HAL *path* is empty for any driver that does not need
-    // one (local-sync and local-task, i.e. every CPU device), and the HAL
-    // *name* is the driver-agnostic "default". An empty string is worse than
-    // useless: r-xla/pjrt indexes a cache by it, and "" is not a usable key
-    // there.
-    //
-    // So the user string is synthesized from the platform name in the shape
-    // XLA's plugins use, "<Platform>Device(id=N)", which is what a caller
-    // reading the leading run of letters expects to find.
+    // Initialize debug strings. The user string is synthesized rather than
+    // taken from the HAL, whose path is empty for any driver that does not
+    // need one (local-sync and local-task, i.e. every CPU device) and whose
+    // name is the driver-agnostic "default".
     user_string_ = DeviceUserString(platform_name, info_->device_id);
     debug_string_ = std::string(info_->name.data, info_->name.size);
     kind_string_ = std::string(info_->name.data, info_->name.size);
@@ -375,10 +365,7 @@ class EventInstance {
   bool is_ready();
 
   // Block until the event is ready and return its status (a clone, owned by
-  // the caller). Upstream leaves PJRT_Event_Await unimplemented because JAX
-  // only ever registers an OnReady callback, but a synchronous client -- e.g.
-  // r-xla/pjrt, which awaits every execute and every host transfer -- calls
-  // this on the very first buffer it reads back.
+  // the caller).
   iree_status_t Await();
 
  private:

@@ -6,7 +6,6 @@
 
 #include "iree_pjrt/common/api_impl.h"
 
-
 #include <iterator>
 #include <optional>
 #include <sstream>
@@ -677,10 +676,8 @@ std::optional<PJRT_Buffer_Type> BufferInstance::element_type() {
 
 DeviceDescription::~DeviceDescription() = default;
 
-// Out-of-line because the initializer list needs ClientInstance complete (see
-// the declaration in api_impl.h): the device description is built from the
-// client's platform name, so that PJRT_DeviceDescription_ToString names the
-// platform this device can actually be resolved back through.
+// Out-of-line because the initializer list reads client.cached_platform_name()
+// and so needs ClientInstance complete (see the declaration in api_impl.h).
 DeviceInstance::DeviceInstance(int client_id, ClientInstance& client,
                                iree_hal_driver_t* driver,
                                iree_hal_device_info_t* info)
